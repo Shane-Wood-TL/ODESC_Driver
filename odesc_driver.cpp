@@ -1,170 +1,290 @@
 /**
- * @file odsec_driver.h
+ * @file odesc_driver.h
  * @brief This is the source file for the odesc class
  * @author Shane Wood
 */
 
 #include "./odesc_driver.h"
 
-odesc::odesc(uint8_t node_ID, twai_node_handle_t twai_handle)
-{
-    this->node_ID = node_ID;
-    this->twai_handle = twai_handle;
-    this-> battery_voltage = 0;
-}
-
-
-
-void odesc::send_message(const uint8_t message_ID, const uint8_t *message_contents, uint8_t message_length, const bool data_returned)
-{
-    // max data size is 8 bytes
-    if (message_length > max_message_size)
-    {
-        return;
-    }
-    if (message_contents == nullptr)
-    {
-        message_length = 0;
-    }
-
-    // setup can node + message ID with some bit manipulation to ensure the messageID is the least sigificant node_id_offset bits
-    uint32_t can_ID = (node_ID << node_id_offset) | (message_ID & lower_five_bits);
-
-   
-
-    // setup the message to transmit
-    twai_frame_t tx_msg {};
-    tx_msg.header.id = can_ID, // Message ID
-    tx_msg.header.ide = false, // Use Normal Frame Format (11-bit ID)
-    (void)memcpy(tx_msg.buffer, message_contents, message_length); // copy the message data
-    tx_msg.buffer_len = message_length;  // Length of data to transmit
-
-    uint8_t recv_buff[128] = {0}; // buffer to receive the data
-    twai_frame_t rx_frame{};
-    rx_frame.buffer = recv_buff;
-    rx_frame.buffer_len = sizeof(recv_buff);
-    rx_frame.tx_queue_priority = 0;
-
-    if(data_returned){
-        while (twai_node_receive_from_isr(twai_handle, &rx_frame) == ESP_OK)
-        {
-        }
-    }
-
-    esp_err_t result = twai_node_transmit(twai_handle, &tx_msg, pdMS_TO_TICKS(200));
-    // if the data was sent successfully, and a response is expected
-    if (data_returned && (result == ESP_OK))
-    {
-        receive_message(message_ID);
-    }
-    else if (data_returned && (result != ESP_OK))
-    {
-        // if the transmit failed, and data is expected, set the battery voltage to 0
-        // if the transmit failed the, then the receive will not be called
-        if (message_ID == Get_Bus_Voltage_Current)
-        {
-            clear_battery_voltage();
-        }
-    }
-}
-
-
-
-
-// not used in the code, but was used for testing to detect the heartbeat
-// messages that are sending data to the microcontroller have a true for sendMessage()
-void odesc::receive_message(uint8_t message_ID)
-{
-    uint8_t recv_buff[128] = {0}; // buffer to receive the data
-    twai_frame_t rx_frame{};
-    rx_frame.buffer = recv_buff;
-    rx_frame.buffer_len = sizeof(recv_buff);
-    rx_frame.tx_queue_priority = 0;
-
-    esp_err_t result = (twai_node_receive_from_isr(twai_handle, &rx_frame) == ESP_OK);
-
-    if (result == ESP_OK)
-    {
-        // majority of these are not implemented as they are not needed, only the battery voltage is needed
-        // if (rx_frame.header.id == ((node_ID << node_id_offset) | Get_Version))
-        // {
-        // }
-        // if (rx_frame.header.id == ((node_ID << node_id_offset) | Get_Error))
-        // {
-        // }
-        if (rx_frame.header.id == ((node_ID << node_id_offset) | Get_Encoder_Estimates))
-        {
-            update_current_motor_velocity(rx_frame);
-        }
-        else if (rx_frame.header.id == ((node_ID << node_id_offset) | Get_Iq))
-        {
-        }
-        // else if (rx_frame.header.id == ((node_ID << node_id_offset) | Get_Temperature))
-        // {
-        // }
-        else if (rx_frame.header.id == ((node_ID << node_id_offset) | Get_Bus_Voltage_Current))
-        {
-            update_battery_voltage(rx_frame);   
-        }
-        // else if (rx_frame.header.id == ((node_ID << node_id_offset) | Get_Torques))
-        // {
-        // }
-        // else if (rx_frame.header.id == ((node_ID << node_id_offset) | Get_Powers))
-        // {
-        // }
-    }
-    else
-    {
-        // if the data was not received, set the battery voltage to 0
-        if (message_ID == Get_Bus_Voltage_Current)
-        {
-            clear_battery_voltage();
-        }
-    }
-}
-
-
-
-
-void odesc::update_battery_voltage(twai_frame_t rx_message)
-{
-    union
-    {
-        float a;
-        uint8_t bytes[bytes_in_float];
-    } temp_union;
-
-    // convert the 4 bytes to a float
-    temp_union.bytes[0] = rx_message.buffer[0];
-    temp_union.bytes[1] = rx_message.buffer[1];
-    temp_union.bytes[2] = rx_message.buffer[2];
-    temp_union.bytes[3] = rx_message.buffer[3];
-    // update the value to be displayed
-
-    battery_voltage = temp_union.a;
-}
-
-
-
-void odesc::clear_battery_voltage()
+odesc::odesc(uint8_t node_ID, twai_node_handle_t handle) : canDriver(node_ID, handle) 
 {
     battery_voltage = 0;
+    bus_current = 0;
+    current_setpoint = 0;
+    current_measured = 0;
+    encoder_position_estimate = 0;
+    encoder_velocity_estimate = 0;
 }
 
+float odesc::convert_to_float(const uint8_t *bytes)
+{
+    float value;
+    memcpy(&value, bytes, sizeof(value));
+    return value;
+}
+
+void odesc::process_rx_frame(const RxQueueItem& item)
+{
+    const uint32_t expected_id_base =
+        static_cast<uint32_t>(get_node_ID()) << node_id_offset;
+
+    if (item.len > 8) {
+        return;
+    }
+
+    if (item.id == 0) {
+        return;
+    }
+    #ifdef USE_HEARTBEAT
+        else if (item.id == (expected_id_base | Heartbeat)) {
+            axis_error = ((uint32_t)item.id)        |
+                        ((uint32_t)(item.id + 1) << 8)   |
+                        ((uint32_t)(item.id + 2) << 16)  |
+                        ((uint32_t)(item.id + 3) << 24);
+
+            axis_current_state = ((uint8_t)(item.id + 4) << 24);
+
+            motor_error_flag = ((item.id + 5) & 1);
+            encoder_error_flag = ((item.id + 6) & 1);
+            controller_error_flag = ((item.id + 7) & 1);
+            trajectory_done_flag =  ((item.id + 7) & 0x80) != 0;
+        }
+    #endif
+    #ifdef USE_GET_MOTOR_ERROR
+        else if (item.id == (expected_id_base | Get_Motor_Error)) {
+            motor_error  = ((uint64_t)item.id)         |
+                        ((uint64_t)(item.id + 1) << 8)   |
+                        ((uint64_t)(item.id + 2) << 16)  |
+                        ((uint64_t)(item.id + 3) << 24)  |
+                        ((uint64_t)(item.id + 4) << 32)  |
+                        ((uint64_t)(item.id + 5) << 40)  |
+                        ((uint64_t)(item.id + 6) << 48)  |
+                        ((uint64_t)(item.id + 7) << 56);
+        }
+    #endif
+    #ifdef USE_GET_ENCODER_ERROR
+        else if (item.id == (expected_id_base | Get_Encoder_Error)) {
+            encoder_error = ((uint32_t)item.id)  |
+                        ((uint32_t)(item.id + 1) << 8)   |
+                        ((uint32_t)(item.id + 2) << 16)  |
+                        ((uint32_t)(item.id + 3) << 24);
+        }
+    #endif
+    #ifdef USE_GET_SENSORLESS_ERROR
+        else if (item.id == (expected_id_base | Get_Sensorless_Error)) {
+            sensorless_error = ((uint32_t)item.id)  |
+                        ((uint32_t)(item.id + 1) << 8)   |
+                        ((uint32_t)(item.id + 2) << 16)  |
+                        ((uint32_t)(item.id + 3) << 24);
+        }
+    #endif
+    #ifdef USE_GET_ENCODER_ESTIMATES
+        else if (item.id == (expected_id_base | Get_Encoder_Estimates)) {
+            encoder_position_estimate = convert_to_float(item.data);
+            encoder_velocity_estimate = convert_to_float(item.data + 4);
+        }
+    #endif
+    #ifdef USE_GET_ENCODER_COUNT
+        else if (item.id == (expected_id_base | Get_Encoder_Count)) {
+            encoder_shadow_count = ((int32_t)item.id)     | 
+                        ((int32_t)(item.id + 1) << 8)       |
+                        ((int32_t)(item.id + 2) << 16)      |
+                        ((int32_t)(item.id + 3) << 24);
+
+            encoder_count_in_cpr = ((int32_t)item.id + 4)     | 
+                        ((int32_t)(item.id + 5) << 8)                |
+                        ((int32_t)(item.id + 6) << 16)                |
+                        ((int32_t)(item.id + 7) << 24);
+        }
+    #endif
+    #ifdef USE_GET_IQ
+        else if (item.id == (expected_id_base | Get_Iq)) {
+            current_setpoint = convert_to_float(item.data);
+            current_measured = convert_to_float(item.data + 4);
+        }
+    #endif
+    #ifdef USE_GET_SENSORLESS_ESTIMATES
+        else if (item.id == (expected_id_base | Get_Sensorless_Estimates)) {
+            sensorless_position_estimate = convert_to_float(item.data);
+            sensorless_velocity_estimate = convert_to_float(item.data + 4);
+        }
+    #endif
+    #ifdef USE_GET_BUS_VOLTAGE_CURRENT
+        else if (item.id == (expected_id_base | Get_Bus_Voltage_Current)) {
+            battery_voltage = convert_to_float(item.data);
+            bus_current = convert_to_float(item.data + 4);
+        }
+    #endif
+    #ifdef USE_GET_ADC_VOLTAGE
+        else if (item.id == (expected_id_base | Get_ADC_Voltage)) {
+            adc_voltage = convert_to_float(item.data);
+        }
+    #endif
+    #ifdef USE_GET_CONTROLLER_ERROR
+        else if (item.id == (expected_id_base | Get_Controller_Error)) {
+            controller_error =  ((uint32_t)item.id)  |
+                        ((uint32_t)(item.id + 1) << 8)   |
+                        ((uint32_t)(item.id + 2) << 16)  |
+                        ((uint32_t)(item.id + 3) << 24);
+        }
+    #endif
+   
+    
+    
+}
+
+#ifdef USE_HEARTBEAT
+    void odesc::update_heartbeat() {
+        odesc::send_message(Heartbeat, nullptr, 0, true);
+    }
+#endif
+#ifdef USE_GET_MOTOR_ERROR
+    void odesc::update_motor_error() {
+        odesc::send_message(Get_Motor_Error, nullptr, 0, true);
+    }
+#endif
+#ifdef USE_GET_ENCODER_ERROR
+    void odesc::update_encoder_error() {
+        odesc::send_message(Get_Encoder_Error, nullptr, 0, true);
+    }
+#endif
+#ifdef USE_GET_SENSORLESS_ERROR
+    void odesc::update_sensorless_error() {
+        odesc::send_message(Get_Sensorless_Error, nullptr, 0, true);
+    }
+#endif
+#ifdef USE_GET_ENCODER_ESTIMATES
+    void odesc::update_encoder_position_and_velocity_estimate() {
+        odesc::send_message(Get_Encoder_Estimates, nullptr, 0, true);
+    }
+#endif
+#ifdef USE_GET_ENCODER_COUNT
+    void odesc::update_encoder_count() {
+        odesc::send_message(Get_Encoder_Count, nullptr, 0, true);
+    }
+#endif
+#ifdef USE_GET_IQ
+    void odesc::update_current_measured_and_setpoint() {
+        odesc::send_message(Get_Iq, nullptr, 0, true);
+    }
+#endif
+#ifdef USE_GET_SENSORLESS_ESTIMATES
+    void odesc::update_sensorless_estimates() {
+        odesc::send_message(Get_Sensorless_Estimates, nullptr, 0, true);
+    }
+#endif
+#ifdef USE_GET_BUS_VOLTAGE_CURRENT
+    void odesc::update_bus_voltage_and_current() {
+        odesc::send_message(Get_Bus_Voltage_Current, nullptr, 0, true);
+    }
+#endif
+#ifdef USE_GET_ADC_VOLTAGE
+    void odesc::update_adc_voltage() {
+        odesc::send_message(Get_ADC_Voltage, nullptr, 0, true);
+    }
+#endif
+#ifdef USE_GET_CONTROLLER_ERROR
+    void odesc::update_controller_error() {
+        odesc::send_message(Get_Controller_Error, nullptr, 0, true);
+    }
+#endif
 
 
-void odesc::update_current_motor_velocity(twai_frame_t rx_message){
-    union
-    {
-        float a;
-        uint8_t bytes[bytes_in_float];
-    } temp_union;
+void odesc::estop() {
+    odesc::send_message(Estop, nullptr, 0, false);
+}
 
-    // convert the 4 bytes to a float
-    temp_union.bytes[0] = rx_message.buffer[4];
-    temp_union.bytes[1] = rx_message.buffer[5];
-    temp_union.bytes[2] = rx_message.buffer[6];
-    temp_union.bytes[3] = rx_message.buffer[7];
+void odesc::set_axis_state(uint32_t state){
+    uint8_t state_bytes[4];
+    (void)memcpy(state_bytes, &state, sizeof(state));
 
-    //battery_voltage = temp_union.a;
+    odesc::send_message(Set_Axis_Requested_State, state_bytes, 4, false);
+}
+
+void odesc::set_cotroller_modes(uint32_t control_mode, uint32_t input_mode){
+    uint8_t payload_bytes[8];
+    (void)memcpy(payload_bytes, &control_mode, sizeof(control_mode));
+    (void)memcpy(payload_bytes + sizeof(control_mode), &input_mode, sizeof(input_mode));
+
+    odesc::send_message(Set_Controller_Modes, payload_bytes, 8, false);
+}
+
+void odesc::set_input_position(float input_position, uint16_t velocity_feedforward, uint16_t torque_feedforward){
+    uint8_t payload_bytes[8];
+    (void)memcpy(payload_bytes, &input_position, sizeof(input_position));
+    (void)memcpy(payload_bytes + sizeof(input_position), &velocity_feedforward, sizeof(velocity_feedforward));
+    (void)memcpy(payload_bytes + sizeof(input_position) + sizeof(velocity_feedforward), &torque_feedforward, sizeof(torque_feedforward));
+    odesc::send_message(Set_Input_Pos, payload_bytes, 8, false);
+}
+
+void odesc::set_input_velocity(float input_velocity, float torque_feedforward) {
+
+    uint8_t payload_bytes[8];
+    (void)memcpy(payload_bytes, &input_velocity, sizeof(input_velocity));
+    (void)memcpy(payload_bytes + sizeof(input_velocity), &torque_feedforward, sizeof(torque_feedforward));
+    odesc::send_message(Set_Input_Vel, payload_bytes, 8, false);
+}
+
+void odesc::set_input_torque(float input_torque) {
+    uint8_t payload_bytes[4];
+    (void)memcpy(payload_bytes, &input_torque, sizeof(input_torque));
+    odesc::send_message(Set_Input_Torque, payload_bytes, 4, false);
+}
+
+void odesc::set_limits(float velocity_limit, float current_limit) {
+    uint8_t payload_bytes[8];
+    (void)memcpy(payload_bytes, &velocity_limit, sizeof(velocity_limit));
+    (void)memcpy(payload_bytes + sizeof(velocity_limit), &current_limit, sizeof(current_limit));
+    odesc::send_message(Set_Limits, payload_bytes, 8, false);
+}
+
+void odesc::start_anticogging() {
+    odesc::send_message(Start_Anitcogging, nullptr, 0, false);
+}
+
+void odesc::set_trajectory_velocity_limit(float trajectory_velocity_limit) {
+    uint8_t payload_bytes[4];
+    (void)memcpy(payload_bytes, &trajectory_velocity_limit, sizeof(trajectory_velocity_limit));
+    odesc::send_message(Set_Traj_Vel_Limit, payload_bytes, 4, false);
+}
+
+void odesc::set_trajectory_accel_limits(float trajectory_accel_limit, float trajectory_decel_limit) {
+    uint8_t payload_bytes[8];
+    (void)memcpy(payload_bytes, &trajectory_accel_limit, sizeof(trajectory_accel_limit));
+    (void)memcpy(payload_bytes + sizeof(trajectory_accel_limit), &trajectory_decel_limit, sizeof(trajectory_decel_limit));
+    odesc::send_message(Set_Traj_Accel_Limits, payload_bytes, 8, false);
+}
+
+void odesc::set_trajectory_inertia(float trajectory_interia) {
+    uint8_t payload_bytes[4];
+    (void)memcpy(payload_bytes, &trajectory_interia, sizeof(trajectory_interia));
+    odesc::send_message(Set_Traj_Inertia, payload_bytes, 4, false);
+}
+
+void odesc::reboot(){
+    odesc::send_message(Reboot, nullptr, 0, false);
+}
+
+void odesc::clear_errors(){
+    odesc::send_message(Clear_Errors, nullptr, 0, false);
+}
+
+void odesc::set_linear_count(int32_t position) {
+    uint8_t payload_bytes[4];
+    (void)memcpy(payload_bytes, &position, sizeof(position));
+
+    odesc::send_message(Set_Linear_Count, payload_bytes, 4, false);
+}
+
+void odesc::set_position_gain(float position_gain) {
+    uint8_t payload_bytes[4];
+    (void)memcpy(payload_bytes, &position_gain, sizeof(position_gain));
+    odesc::send_message(Set_Position_Gain, payload_bytes, 4, false);
+}
+
+void odesc::set_vel_gains(float velocity_gain, float velocity_integrator_gain) {
+    uint8_t payload_bytes[8];
+    (void)memcpy(payload_bytes, &velocity_gain, sizeof(velocity_gain));
+    (void)memcpy(payload_bytes + sizeof(velocity_gain), &velocity_integrator_gain, sizeof(velocity_integrator_gain));
+    odesc::send_message(Set_Vel_Gains, payload_bytes, 8, false);
 }
